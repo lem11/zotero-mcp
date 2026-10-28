@@ -694,6 +694,9 @@ class ZoteroSemanticSearch:
     # Class-level fallback so instances built without __init__ (test doubles
     # do this) still resolve the attribute — None means "use the config".
     extraction_workers: int | None = None
+    # Same fallback for the two extraction choices read from the config.
+    attachment_priority: tuple[str, ...] = ("pdf", "html", "other")
+    index_all_attachments: bool = False
 
     # Serializes every ChromaDB call made from the streaming index path, where
     # a producer thread classifies one slice while the main thread commits the
@@ -731,6 +734,8 @@ class ZoteroSemanticSearch:
         # Which attachment kinds the web-API fulltext path tries, in order.
         # Shared with the local extraction path so both make the same choice.
         self.attachment_priority = self._load_attachment_priority()
+        # Opt-in: index every text-bearing attachment instead of the best one.
+        self.index_all_attachments = self._load_index_all_attachments()
         # Item keys seen by the most recent local sqlite scan (set by
         # _get_items_from_local_db); used to verify watermark promotion.
         self._last_scan_snapshot_keys: set[str] | None = None
@@ -765,6 +770,26 @@ class ZoteroSemanticSearch:
             except Exception as e:
                 logger.warning(f"Error loading attachment_priority: {e}")
         return normalize_attachment_priority(raw)
+
+    def _load_index_all_attachments(self) -> bool:
+        """Whether every text-bearing attachment is indexed, or only the best.
+
+        Reads ``semantic_search.extraction.index_all_attachments``. Off by
+        default: one source per item is cheaper and avoids indexing the same
+        material twice (a transcript and the slides it narrates, for example).
+        """
+        if self.config_path and os.path.exists(self.config_path):
+            try:
+                with open(self.config_path) as f:
+                    return bool(
+                        json.load(f)
+                        .get("semantic_search", {})
+                        .get("extraction", {})
+                        .get("index_all_attachments", False)
+                    )
+            except Exception as e:
+                logger.warning(f"Error loading index_all_attachments: {e}")
+        return False
 
     def _load_chunking_config(self) -> dict[str, Any]:
         """Load passage-chunking configuration from file or use defaults.
@@ -1630,8 +1655,11 @@ class ZoteroSemanticSearch:
                 ) as reader,
             ):
                 # Stamped on every document so a later run can tell that the
-                # chosen attachment kind may have changed under it.
-                priority_tag = ",".join(reader.attachment_priority)
+                # chosen attachment kind — or the all-attachments mode — may
+                # have changed under it.
+                priority_tag = ",".join(reader.attachment_priority) + (
+                    "|all" if self.index_all_attachments else ""
+                )
                 # Capture the snapshot's full key set on the SAME connection
                 # this scan uses. The staleness check after the (potentially
                 # long) extraction must compare against what this scan could
@@ -1901,7 +1929,34 @@ class ZoteroSemanticSearch:
                                 continue
                             if result:
                                 target.fulltext, target.fulltext_source = result
-                            elif getattr(target, "_attachment_keys", ""):
+                            if self.index_all_attachments:
+                                try:
+                                    all_parts = reader.extract_fulltext_all(
+                                        target.item_id, target.key
+                                    )
+                                except Exception as e:
+                                    logger.debug(
+                                        f"extract_fulltext_all({target.key}) failed: {e}"
+                                    )
+                                    all_parts = []
+                                if all_parts:
+                                    target.fulltext_parts = [
+                                        {
+                                            "attachment_key": attachment_key,
+                                            "text": text,
+                                            "source": source,
+                                        }
+                                        for attachment_key, text, source in all_parts
+                                    ]
+                                    target.fulltext = "\n\n".join(
+                                        text for _, text, _ in all_parts
+                                    )
+                                    target.fulltext_source = "+".join(
+                                        source for _, _, source in all_parts
+                                    )
+                                elif not result and getattr(target, "_attachment_keys", ""):
+                                    target._fulltext_attempted = True
+                            elif not result and getattr(target, "_attachment_keys", ""):
                                 # An attachment existed but produced no text —
                                 # record the attempt so incremental runs don't
                                 # re-parse it until something changes.
@@ -2018,6 +2073,8 @@ class ZoteroSemanticSearch:
                         api_item["data"]["attachmentKeys"] = att
                     if (prio := getattr(item, "_attachment_priority", None)) is not None:
                         api_item["data"]["attachmentPriority"] = prio
+                    if parts := getattr(item, "fulltext_parts", None):
+                        api_item["data"]["fulltext_parts"] = parts
 
                     # Add notes if available
                     if item.notes:
@@ -2077,12 +2134,61 @@ class ZoteroSemanticSearch:
             (text, source) where source is ``web-api:attachment:<key>``. Empty
             strings mean no fulltext is available for this item.
         """
+        return self._fulltext_from_attachments(self._candidate_attachment_keys(item_key))
+
+    def _fetch_fulltext_parts_via_web_api(self, item_key: str) -> list[dict[str, str]]:
+        """Every text-bearing attachment of an item that Zotero has text for.
+
+        The multi-source counterpart of :meth:`_fetch_fulltext_via_web_api`,
+        used when ``index_all_attachments`` is on.
+        """
+        return self._fulltext_parts_from_attachments(
+            self._candidate_attachment_keys(item_key)
+        )
+
+    def _candidate_attachment_keys(
+        self, item_key: str, by_parent: dict[str, list[str]] | None = None
+    ) -> list[str]:
+        """The item's attachment keys, in configured priority order."""
+        if by_parent is not None:
+            return by_parent.get(item_key, [])
         try:
             children = _paginate(self.zotero_client.children, item_key) or []
         except Exception as e:
             logger.debug(f"children({item_key}) failed: {e}")
             children = []
-        return self._fulltext_from_attachments(self._ordered_attachment_keys(children))
+        return self._ordered_attachment_keys(children)
+
+    def _fulltext_parts_from_attachments(
+        self, attachment_keys: list[str | None]
+    ) -> list[dict[str, str]]:
+        """Every attachment in ``attachment_keys`` that has extracted text.
+
+        Unlike :meth:`_fulltext_from_attachments`, an empty or failed
+        attachment does not stop the walk: each readable file contributes its
+        own part, so the indexer can keep them in separate chunk groups.
+        """
+        parts: list[dict[str, str]] = []
+        for child_key in attachment_keys:
+            if not child_key:
+                continue
+            try:
+                resp = self.zotero_client.fulltext_item(child_key)
+            except Exception as e:
+                logger.debug(f"fulltext_item({child_key}) failed: {e}")
+                continue
+            text = str(resp.get("content", "") or "") if isinstance(resp, dict) else (
+                resp if isinstance(resp, str) else ""
+            )
+            if text.strip():
+                parts.append(
+                    {
+                        "attachment_key": child_key,
+                        "text": text,
+                        "source": f"web-api:attachment:{child_key}",
+                    }
+                )
+        return parts
 
     @staticmethod
     def _fulltext_attachment(child: Any) -> tuple[str, str] | None:
@@ -2216,18 +2322,26 @@ class ZoteroSemanticSearch:
             # Zotero holds no text under their own key: ask for their
             # text-bearing attachments (the parent probe was a request per
             # item that always came back empty).
-            if attachment_keys is not None:
-                text, source = self._fulltext_from_attachments(
-                    attachment_keys.get(key, [])
-                )
+            keys = self._candidate_attachment_keys(key, attachment_keys)
+            if self.index_all_attachments:
+                parts = self._fulltext_parts_from_attachments(keys)
+                if parts:
+                    data["fulltext"] = "\n\n".join(part["text"] for part in parts)
+                    data["fulltextSource"] = "+".join(
+                        part["source"] for part in parts
+                    )
+                    data["fulltext_parts"] = parts
+                    fetched += 1
+                else:
+                    data["fulltext_attempted"] = True
             else:
-                text, source = self._fetch_fulltext_via_web_api(key)
-            if text:
-                data["fulltext"] = text
-                data["fulltextSource"] = source
-                fetched += 1
-            else:
-                data["fulltext_attempted"] = True
+                text, source = self._fulltext_from_attachments(keys)
+                if text:
+                    data["fulltext"] = text
+                    data["fulltextSource"] = source
+                    fetched += 1
+                else:
+                    data["fulltext_attempted"] = True
             if idx % 25 == 0 or idx == total:
                 try:
                     sys.stderr.write(f"\r  Fulltext: {idx}/{total} items checked, {fetched} with text")
@@ -3290,43 +3404,157 @@ class ZoteroSemanticSearch:
                     continue
                 docs_before = len(documents)
 
-                # Create document text and metadata
-                # Always include structured fields; append fulltext when available
-                fulltext = item.get("data", {}).get("fulltext", "")
+                # Create document text and metadata.
+                # Structured fields are always indexed. Fulltext is appended
+                # once, to the first text group, so item metadata is not
+                # duplicated across a multi-attachment item.
+                data = item.get("data", {})
                 structured_text = self._create_document_text(item)
-                if fulltext.strip():
-                    doc_text = (structured_text + "\n\n" + fulltext) if structured_text.strip() else fulltext
-                else:
-                    doc_text = structured_text
                 metadata = self._create_metadata(item)
 
-                if not doc_text.strip():
+                groups: list[tuple[str, dict[str, str]]] = []
+                raw_parts = data.get("fulltext_parts") or []
+                if self.index_all_attachments and (
+                    raw_parts or (data.get("fulltext") or "").strip()
+                ):
+                    if not raw_parts and (data.get("fulltext") or "").strip():
+                        raw_parts = [
+                            {
+                                "attachment_key": "",
+                                "text": data["fulltext"],
+                                "source": data.get("fulltextSource", ""),
+                            }
+                        ]
+                    first = True
+                    for part in raw_parts:
+                        body = part.get("text") or ""
+                        if not body.strip():
+                            continue
+                        text = (
+                            structured_text + "\n\n" + body
+                            if first and structured_text.strip()
+                            else body
+                        )
+                        first = False
+                        groups.append((text, part))
+                    if not groups and structured_text.strip():
+                        groups.append(
+                            (
+                                structured_text,
+                                {"attachment_key": "", "text": "", "source": ""},
+                            )
+                        )
+                else:
+                    fulltext = data.get("fulltext", "")
+                    if fulltext.strip():
+                        text = (
+                            structured_text + "\n\n" + fulltext
+                            if structured_text.strip()
+                            else fulltext
+                        )
+                        groups.append(
+                            (
+                                text,
+                                {
+                                    "attachment_key": "",
+                                    "text": fulltext,
+                                    "source": data.get("fulltextSource", ""),
+                                },
+                            )
+                        )
+                    elif structured_text.strip():
+                        groups.append(
+                            (
+                                structured_text,
+                                {"attachment_key": "", "text": "", "source": ""},
+                            )
+                        )
+
+                if not groups:
                     stats["skipped"] += 1
                     continue
 
                 if chunking:
                     # Index one vector per overlapping passage so search can
                     # return a grounded quote and long PDFs stay searchable
-                    # past the single-vector truncation limit.
-                    passages = split_into_passages(doc_text, chunk_size, overlap, max_chunks)
-                    if not passages:
+                    # past the single-vector truncation limit. Each attachment
+                    # gets its own passage group and its own cap.
+                    prepared: list[
+                        tuple[str, int, int, str, str, int, int, int, int, str]
+                    ] = []
+                    for attachment_index, (text, part) in enumerate(groups):
+                        passages = split_into_passages(
+                            text, chunk_size, overlap, max_chunks
+                        )
+                        for attachment_chunk_index, (chunk_text, c0, c1) in enumerate(
+                            passages
+                        ):
+                            prepared.append(
+                                (
+                                    chunk_text,
+                                    c0,
+                                    c1,
+                                    part.get("attachment_key", ""),
+                                    part.get("source", ""),
+                                    attachment_index,
+                                    attachment_chunk_index,
+                                    len(passages),
+                                    len(groups),
+                                    text,
+                                )
+                            )
+                    if not prepared:
                         stats["skipped"] += 1
                         continue
-                    n_chunks = len(passages)
-                    for ci, (chunk_text, c0, c1) in enumerate(passages):
+                    n_chunks = len(prepared)
+                    for ci, (
+                        chunk_text,
+                        c0,
+                        c1,
+                        attachment_key,
+                        attachment_source,
+                        attachment_index,
+                        attachment_ci,
+                        attachment_n,
+                        attachment_count,
+                        source_text,
+                    ) in enumerate(prepared):
                         cmeta = dict(metadata)
                         cmeta["parent_item_key"] = item_key
                         cmeta["chunk_index"] = ci
                         cmeta["n_chunks"] = n_chunks
                         cmeta["char_start"] = c0
                         cmeta["char_end"] = c1
-                        page = _page_for_offset(doc_text, c0)
+                        if attachment_key:
+                            cmeta["attachment_key"] = attachment_key
+                            cmeta["attachment_source"] = attachment_source
+                            # 0 is the highest-priority attachment, so a
+                            # downstream ranker can deprioritize supplementary
+                            # material without losing it from the index (#494).
+                            cmeta["attachment_index"] = attachment_index
+                            cmeta["attachment_count"] = attachment_count
+                            cmeta["attachment_chunk_index"] = attachment_ci
+                            cmeta["attachment_n_chunks"] = attachment_n
+                        page = _page_for_offset(source_text, c0)
                         if page is not None:
                             cmeta["page"] = page
                         documents.append(self.chroma_client.truncate_text(chunk_text))
                         metadatas.append(cmeta)
                         ids.append(f"{item_key}#{ci}")
                 else:
+                    # A single vector cannot keep attachment groups apart, so
+                    # the parts are joined. index_all_attachments is most
+                    # useful with chunking on; without it this is equivalent
+                    # to concatenating the item's readable attachments.
+                    bodies = [part.get("text", "") for _, part in groups]
+                    joined = "\n\n".join(body for body in bodies if body.strip())
+                    if structured_text.strip() and joined:
+                        doc_text = structured_text + "\n\n" + joined
+                    else:
+                        doc_text = joined or structured_text
+                    if not doc_text.strip():
+                        stats["skipped"] += 1
+                        continue
                     # Truncate to fit the configured embedding model's token limit
                     documents.append(self.chroma_client.truncate_text(doc_text))
                     metadatas.append(metadata)

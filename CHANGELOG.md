@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`semantic_search.extraction.index_all_attachments` indexes every readable attachment of an item.** Off by default, because one source per item is cheaper and avoids indexing the same material twice. With chunking on, each attachment becomes its own passage group with its own `max_chunks_per_item` budget, and its passages carry `attachment_key`/`attachment_source`, `attachment_index` (0 = highest priority) and a per-file chunk position; `chunk_index` and `n_chunks` still span the item, so pruning and the deleted-file pass are unchanged. Works through both the server-side fulltext path and local `--fulltext` extraction (`LocalZoteroReader.extract_fulltext_all`). Without chunking the parts are concatenated.
+
 ### Fixed
 
 - **Semantic indexing reads HTML snapshots and other text attachments, not only PDFs.** The web-API fulltext path asked for `application/pdf` children alone, so an item whose readable attachment was an HTML snapshot was indexed with its title and abstract only (`has_fulltext: failed`), and an item with both a PDF and an HTML transcript silently indexed the slides and dropped the transcript. The path now classifies every attachment the way the local extractor does — PDF, HTML, Markdown, plain text — honours `semantic_search.extraction.attachment_priority` (set `["html", "pdf", "other"]` to prefer a transcript snapshot), and falls back to the next attachment when the preferred one has no extracted text. Both the per-item children walk and the whole-library attachment listing are covered.

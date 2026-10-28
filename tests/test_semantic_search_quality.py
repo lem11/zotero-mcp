@@ -116,6 +116,76 @@ class TestCombineStructuredAndFulltext:
 
 
 # ---------------------------------------------------------------------------
+# Opt-in: index every attachment of an item
+# ---------------------------------------------------------------------------
+
+class TestIndexAllAttachments:
+    def _make_search(self):
+        with patch.object(semantic_search, "get_zotero_client", return_value=object()):
+            search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
+        search.index_all_attachments = True
+        search._chunking_config = {
+            "enabled": True,
+            "chunk_size": 80,
+            "overlap": 0,
+            "max_chunks_per_item": 2,
+        }
+        return search
+
+    @staticmethod
+    def _item():
+        return {
+            "key": "K1",
+            "data": {
+                "title": "Two files",
+                "itemType": "presentation",
+                "creators": [],
+                "fulltext_parts": [
+                    {"attachment_key": "A", "text": "alpha " * 30, "source": "src:a"},
+                    {"attachment_key": "B", "text": "beta " * 10, "source": "src:b"},
+                ],
+            },
+        }
+
+    def test_each_attachment_gets_its_own_chunk_group(self):
+        search = self._make_search()
+        prepared = search._prepare_and_classify_slice([self._item()], force_rebuild=True)
+
+        # A is capped at two passages; B contributes one. Ids stay in the
+        # item's single namespace so pruning and probing are unchanged.
+        assert prepared["ids"] == ["K1#0", "K1#1", "K1#2"]
+        metas = prepared["metadatas"]
+        assert [m["attachment_key"] for m in metas] == ["A", "A", "B"]
+        assert [m["attachment_index"] for m in metas] == [0, 0, 1]
+        assert [m["attachment_count"] for m in metas] == [2, 2, 2]
+        assert [m["attachment_chunk_index"] for m in metas] == [0, 1, 0]
+        assert [m["attachment_n_chunks"] for m in metas] == [2, 2, 1]
+        assert all(m["n_chunks"] == 3 for m in metas)
+        assert "alpha" in prepared["documents"][0]
+        assert "beta" not in prepared["documents"][0]
+        assert "beta" in prepared["documents"][2]
+        assert "alpha" not in prepared["documents"][2]
+
+    def test_without_chunking_the_parts_are_concatenated(self):
+        search = self._make_search()
+        search._chunking_config = {"enabled": False}
+        prepared = search._prepare_and_classify_slice([self._item()], force_rebuild=True)
+
+        assert prepared["ids"] == ["K1"]
+        document = prepared["documents"][0]
+        assert "alpha" in document and "beta" in document
+        assert document.index("alpha") < document.index("beta")
+
+    def test_flag_off_keeps_one_attachment(self):
+        search = self._make_search()
+        search.index_all_attachments = False
+        item = self._item()
+        item["data"]["fulltext"] = "alpha " * 30
+        prepared = search._prepare_and_classify_slice([item], force_rebuild=True)
+        assert all(m.get("attachment_key") is None for m in prepared["metadatas"])
+
+
+# ---------------------------------------------------------------------------
 # Fix 2: Gemini query/document embedding asymmetry
 # ---------------------------------------------------------------------------
 

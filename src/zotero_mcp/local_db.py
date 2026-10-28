@@ -1607,6 +1607,67 @@ class LocalZoteroReader:
         extraction = self.extract_fulltext_detailed(item_id, item_key)
         return (extraction.text, extraction.source) if extraction else None
 
+    def extract_fulltext_all(
+        self, item_id: int, item_key: str | None = None
+    ) -> list[tuple[str, str, str]]:
+        """Extract every text-bearing attachment of one item.
+
+        Returns ``(attachment_key, text, source)`` triples in the configured
+        ``attachment_priority`` order. One item can therefore contribute more
+        than one text; the semantic indexer groups them per attachment when
+        ``index_all_attachments`` is on.
+
+        Unlike :meth:`extract_fulltext_detailed` this does not stop at the
+        first readable attachment, and it does not fall back to Zotero's
+        ``.zotero-ft-cache`` per attachment: the cache is flat text with no
+        provenance, while this path already knows the attachment key.
+        """
+        candidates: list[tuple[str, int, str, Path]] = []
+        for key, path, ctype in self._iter_parent_attachments(item_id):
+            resolved = self._resolve_attachment_path(key, path or "")
+            if not resolved or not resolved.exists():
+                resolved = self._scan_storage_for_attachment(key, ctype)
+            if not resolved or not resolved.exists():
+                continue
+            category = categorize_attachment(resolved, ctype)
+            if category is None:
+                continue
+            try:
+                size = resolved.stat().st_size
+            except OSError:
+                size = 0
+            candidates.append((category, size, key, resolved))
+
+        priority = self.attachment_priority
+        named = {entry for entry in priority if entry != "other"}
+
+        def rank(category: str) -> int | None:
+            for index, entry in enumerate(priority):
+                if entry == "other":
+                    if category not in named:
+                        return index
+                elif entry == category:
+                    return index
+            return None
+
+        ranked = [candidate for candidate in candidates if rank(candidate[0]) is not None]
+        ranked.sort(key=lambda candidate: (rank(candidate[0]), -candidate[1]))
+
+        parts: list[tuple[str, str, str]] = []
+        for _category, _size, key, path in ranked:
+            hit = self._cache_lookup(path, key)
+            if hit:
+                text, source = hit
+            else:
+                doc = self._extract_doc_from_file(path)
+                if not doc:
+                    continue
+                text, source = doc.text, _source_for_path(path)
+                self._cache_store(path, key, item_key, text, source)
+            if text.strip():
+                parts.append((key, text, source))
+        return parts
+
     def close(self):
         """Close database connection."""
         if self._connection:

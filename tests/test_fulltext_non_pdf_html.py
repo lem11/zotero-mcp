@@ -153,3 +153,67 @@ def test_extract_fulltext_ignores_binary_attachment(tmp_path):
         fake_path_for={"D0001": binary},
     )
     assert reader._extract_fulltext_for_item(item_id=1) is None
+
+class _AllReader(_Reader):
+    """Stub that reads every attachment and records cache calls."""
+
+    def __init__(self, attachments, fake_path_for=None, texts=None):
+        super().__init__(attachments, fake_path_for=fake_path_for)
+        self.fulltext_cache_enabled = False
+        self._texts = texts or {}
+
+    def _cache_lookup(self, target, attachment_key):
+        return None
+
+    def _cache_store(self, *args, **kwargs):
+        return None
+
+    def _extract_doc_from_file(self, path):
+        return extracted_doc(self._texts[Path(path).suffix.lower()])
+
+
+def test_extract_fulltext_all_reads_every_readable_attachment(tmp_path):
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    html = tmp_path / "snapshot.html"
+    html.write_text("<p>transcript</p>")
+    image = tmp_path / "scan.png"
+    image.write_bytes(b"\x89PNG\r\n")
+
+    reader = _AllReader(
+        attachments=[
+            ("HTM", "storage:snapshot.html", "text/html"),
+            ("IMG", "storage:scan.png", "image/png"),
+            ("PDF", "storage:paper.pdf", "application/pdf"),
+        ],
+        fake_path_for={"HTM": html, "IMG": image, "PDF": pdf},
+        texts={".pdf": "PDF body.", ".html": "Transcript body."},
+    )
+
+    parts = reader.extract_fulltext_all(item_id=1)
+
+    # Default priority is PDF before HTML; the image is not text-bearing.
+    assert [(key, text) for key, text, _source in parts] == [
+        ("PDF", "PDF body."),
+        ("HTM", "Transcript body."),
+    ]
+
+
+def test_extract_fulltext_all_honours_priority(tmp_path):
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    html = tmp_path / "snapshot.html"
+    html.write_text("<p>transcript</p>")
+
+    reader = _AllReader(
+        attachments=[
+            ("PDF", "storage:paper.pdf", "application/pdf"),
+            ("HTM", "storage:snapshot.html", "text/html"),
+        ],
+        fake_path_for={"HTM": html, "PDF": pdf},
+        texts={".pdf": "PDF body.", ".html": "Transcript body."},
+    )
+    reader.attachment_priority = ("html", "pdf", "other")
+
+    parts = reader.extract_fulltext_all(item_id=1)
+    assert [p[0] for p in parts] == ["HTM", "PDF"]

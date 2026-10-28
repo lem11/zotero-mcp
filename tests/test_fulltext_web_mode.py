@@ -299,6 +299,54 @@ def test_fetch_fulltext_falls_back_when_preferred_attachment_has_no_text(monkeyp
     assert source == "web-api:attachment:HTM"
 
 
+def test_index_all_attachments_collects_every_readable_file(monkeypatch, tmp_path):
+    """With the flag on, HTML and PDF both contribute, in priority order."""
+    parent = _paper("PAR", item_type="presentation")
+    zot = FakeZoteroClient()
+    zot.load_scenario(
+        [parent],
+        fulltext={"PDF": {"content": "Slide body."}, "HTM": {"content": "Transcript body."}},
+        children={"PAR": [_pdf("PDF"), _html("HTM")]},
+    )
+    config = _write_config(
+        tmp_path,
+        {
+            "extraction": {
+                "attachment_priority": ["html", "pdf", "other"],
+                "index_all_attachments": True,
+            }
+        },
+    )
+    search = _build_search(monkeypatch, zot, FakeChromaClient(), config_path=config)
+    items = search._get_items_from_api(include_fulltext=True)
+    data = items[0]["data"]
+    assert [part["attachment_key"] for part in data["fulltext_parts"]] == ["HTM", "PDF"]
+    assert data["fulltext_parts"][0]["text"] == "Transcript body."
+    assert data["fulltext"].index("Transcript") < data["fulltext"].index("Slide")
+    assert data["fulltextSource"] == (
+        "web-api:attachment:HTM+web-api:attachment:PDF"
+    )
+
+
+def test_index_all_attachments_skips_a_file_without_text(monkeypatch, tmp_path):
+    parent = _paper("PAR", item_type="presentation")
+    zot = FakeZoteroClient()
+    zot.load_scenario(
+        [parent],
+        fulltext={"HTM": {"content": "Transcript body."}},  # PDF has no text
+        children={"PAR": [_pdf("PDF"), _html("HTM")]},
+    )
+    config = _write_config(
+        tmp_path,
+        {"extraction": {"index_all_attachments": True}},
+    )
+    search = _build_search(monkeypatch, zot, FakeChromaClient(), config_path=config)
+    items = search._get_items_from_api(include_fulltext=True)
+    parts = items[0]["data"]["fulltext_parts"]
+    assert [part["attachment_key"] for part in parts] == ["HTM"]
+    assert items[0]["data"]["fulltext"] == "Transcript body."
+
+
 def test_fetch_fulltext_ignores_non_text_attachments(monkeypatch):
     parent = _paper("PAR")
     image = {

@@ -189,7 +189,8 @@ PDFs are parsed with [pdf-inspector](https://github.com/firecrawl/pdf-inspector)
     "extraction": {
       "pdf_max_pages": 50,
       "fulltext_display_max_pages": 10,
-      "attachment_priority": ["markdown", "pdf", "html", "other"]
+      "attachment_priority": ["markdown", "pdf", "html", "other"],
+      "index_all_attachments": false
     }
   }
 }
@@ -200,10 +201,13 @@ PDFs are parsed with [pdf-inspector](https://github.com/firecrawl/pdf-inspector)
 | `pdf_max_pages` | `50` | Pages extracted per PDF when indexing. Raising it does not widen what search sees on its own — that is bounded by the embedding model's token limit or `chunking.max_chunks_per_item`. |
 | `fulltext_display_max_pages` | `10` | Pages returned by `zotero_get_item_fulltext`. Separate from the above because reading a paper is bounded by your assistant's context, not by recall. |
 | `attachment_priority` | `["pdf", "html", "other"]` | Order in which attachment kinds are tried when an item has several readable files. Used by both the local extractor and the server-side fulltext path. |
+| `index_all_attachments` | `false` | Index every readable attachment of an item instead of only the best one. Requires `chunking.enabled`. |
 
 **`attachment_priority`** exists for the case where you have converted a paper to clean Markdown yourself and attached it next to the original PDF. By default the PDF still wins; listing `"markdown"` first makes your converted copy the one that gets read and indexed. Valid entries are `pdf`, `html`, `markdown`, `text` and `other`. `other` is a catch-all matching every kind not named elsewhere in the list, so the default sweeps Markdown and plain text into one bucket where the larger file wins. Omitting `other` means anything unlisted is never chosen.
 
 Changing this setting marks affected items for re-extraction, so a following `zotero-mcp update-db` refreshes text that came from a now-deprioritized attachment rather than leaving stale embeddings behind.
+
+**`index_all_attachments`** is off by default: one source per item is cheaper and avoids indexing the same material twice. Turn it on when an item's attachments carry genuinely different content — a transcript and the slide deck it narrates, a paper and its supplementary data, or a Markdown conversion kept next to the original PDF. With chunking on, each attachment is split into its own passage group and gets the full `max_chunks_per_item` budget, so an item with several files can contribute more than that number of passages in total; each passage records `attachment_key`, `attachment_source`, `attachment_index` (0 is the highest-priority file) and its position within that file, while the item's `chunk_index` and `n_chunks` still span the whole item so pruning and deleted-file handling are unchanged. Without chunking the parts are concatenated, because one vector cannot keep them apart. Turning the option on does not retroactively reindex items already in the index: they pick it up the next time they are reindexed. To apply it immediately, remove those items' documents from the collection (or rebuild the index).
 
 To read one specific attachment regardless of priority, pass that attachment's own key to `zotero_get_item_fulltext` (find it with `zotero_get_item_children`) — an attachment key bypasses the priority order and reads exactly that file.
 
