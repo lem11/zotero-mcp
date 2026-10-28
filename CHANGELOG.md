@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Semantic indexing reads HTML snapshots and other text attachments, not only PDFs.** The web-API fulltext path asked for `application/pdf` children alone, so an item whose readable attachment was an HTML snapshot was indexed with its title and abstract only (`has_fulltext: failed`), and an item with both a PDF and an HTML transcript silently indexed the slides and dropped the transcript. The path now classifies every attachment the way the local extractor does — PDF, HTML, Markdown, plain text — honours `semantic_search.extraction.attachment_priority` (set `["html", "pdf", "other"]` to prefer a transcript snapshot), and falls back to the next attachment when the preferred one has no extracted text. Both the per-item children walk and the whole-library attachment listing are covered.
+
 ## [0.15.1] - 2026-10-16
 
 ### Added

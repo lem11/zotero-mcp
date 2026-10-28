@@ -46,7 +46,7 @@ from .config_light import (  # noqa: F401
     should_update,
 )
 from .embeddings.registry import batch_capable_providers
-from .extract import PAGE_SEPARATOR
+from .extract import PAGE_SEPARATOR, categorize_attachment, normalize_attachment_priority
 from .identifiers import metadata_match_keys
 from .local_db import PERSONAL_LIBRARY_GROUP_ID, LocalZoteroReader
 from .utils import (
@@ -728,6 +728,9 @@ class ZoteroSemanticSearch:
         self.config_path = config_path
         self.db_path = db_path  # CLI override for Zotero database path
         self.extraction_workers = extraction_workers  # CLI override, None = use config
+        # Which attachment kinds the web-API fulltext path tries, in order.
+        # Shared with the local extraction path so both make the same choice.
+        self.attachment_priority = self._load_attachment_priority()
         # Item keys seen by the most recent local sqlite scan (set by
         # _get_items_from_local_db); used to verify watermark promotion.
         self._last_scan_snapshot_keys: set[str] | None = None
@@ -746,6 +749,22 @@ class ZoteroSemanticSearch:
         # Passage-level chunking (opt-in; default off preserves item-level
         # indexing and existing collections byte-for-byte).
         self._chunking_config = self._load_chunking_config()
+
+    def _load_attachment_priority(self) -> tuple[str, ...]:
+        """Attachment kinds to try, in order, when picking an item's fulltext.
+
+        Reads ``semantic_search.extraction.attachment_priority`` — the same
+        setting the local extraction path uses — so the API path makes the
+        same choice. Falls back to ``("pdf", "html", "other")`` when unset.
+        """
+        raw = None
+        if self.config_path and os.path.exists(self.config_path):
+            try:
+                with open(self.config_path) as f:
+                    raw = json.load(f).get("semantic_search", {}).get("extraction", {}).get("attachment_priority")
+            except Exception as e:
+                logger.warning(f"Error loading attachment_priority: {e}")
+        return normalize_attachment_priority(raw)
 
     def _load_chunking_config(self) -> dict[str, Any]:
         """Load passage-chunking configuration from file or use defaults.
@@ -2044,10 +2063,15 @@ class ZoteroSemanticSearch:
     def _fetch_fulltext_via_web_api(self, item_key: str) -> tuple[str, str]:
         """Fetch the fulltext Zotero already extracted for a top-level item.
 
-        Zotero keeps extracted text per PDF attachment, never under the parent
-        item's own key, so this walks the item's PDF attachment children and
-        returns the first that has any. It works against the web API and the
-        local API alike, without needing the PDF file.
+        Zotero keeps extracted text per attachment, never under the parent
+        item's own key, so this walks the item's text-bearing attachment
+        children and returns the first that has any. It works against the web
+        API and the local API alike, without needing the files themselves.
+
+        Every kind Zotero indexes is eligible — PDF, HTML snapshot, Markdown,
+        plain text — not just PDFs. An item whose only readable attachment is
+        an HTML snapshot (a presentation transcript, say) used to be indexed
+        with no text at all.
 
         Returns:
             (text, source) where source is ``web-api:attachment:<key>``. Empty
@@ -2058,19 +2082,51 @@ class ZoteroSemanticSearch:
         except Exception as e:
             logger.debug(f"children({item_key}) failed: {e}")
             children = []
-        return self._fulltext_from_attachments(
-            [self._pdf_attachment_key(child) for child in children]
-        )
+        return self._fulltext_from_attachments(self._ordered_attachment_keys(children))
 
     @staticmethod
-    def _pdf_attachment_key(child: Any) -> str | None:
-        """The key of ``child`` when it is a PDF attachment, else None."""
+    def _fulltext_attachment(child: Any) -> tuple[str, str] | None:
+        """``(category, key)`` for a text-bearing attachment child.
+
+        PDFs, HTML snapshots, Markdown and plain text all count, because
+        Zotero indexes each of them and serves the extracted text under the
+        attachment key. Images, audio, video and office binaries are dropped:
+        there is no text to fetch. Classification uses the filename and
+        content type, the same rule the local extraction path applies.
+        """
         data = child.get("data", {}) if isinstance(child, dict) else {}
         if data.get("itemType") != "attachment":
             return None
-        if data.get("contentType") != "application/pdf":
+        key = child.get("key") or data.get("key")
+        if not key:
             return None
-        return child.get("key") or data.get("key") or None
+        category = categorize_attachment(data.get("filename") or "", data.get("contentType"))
+        if not category:
+            return None
+        return category, key
+
+    def _ordered_attachment_keys(self, children: list[Any]) -> list[str]:
+        """Attachment keys in configured priority order.
+
+        Returning every candidate, rather than only the first, keeps the
+        fallback behaviour: if the preferred attachment has no extracted text
+        the next one is tried. Categories absent from the priority list are
+        dropped unless ``"other"`` covers them.
+        """
+        priority_index = {name: i for i, name in enumerate(self.attachment_priority)}
+        fallback = priority_index.get("other")
+        ordered: list[tuple[int, int, str]] = []
+        for position, child in enumerate(children):
+            found = self._fulltext_attachment(child)
+            if not found:
+                continue
+            category, key = found
+            index = priority_index.get(category, fallback)
+            if index is None:
+                continue
+            ordered.append((index, position, key))
+        ordered.sort()
+        return [key for _, _, key in ordered]
 
     def _fulltext_from_attachments(self, attachment_keys: list[str | None]) -> tuple[str, str]:
         """Zotero's extracted text for the first of ``attachment_keys`` that has any."""
@@ -2093,8 +2149,8 @@ class ZoteroSemanticSearch:
     # of the attachments is cheaper than asking for each item's children.
     _BULK_ATTACHMENT_WALK_MIN_ITEMS = 25
 
-    def _pdf_attachment_keys_by_parent(self) -> dict[str, list[str]] | None:
-        """PDF attachment keys grouped by parent key, from one paged listing.
+    def _attachment_keys_by_parent(self) -> dict[str, list[str]] | None:
+        """Text-bearing attachment keys grouped by parent, in priority order.
 
         None when the listing fails, so the caller can fall back to asking
         per item.
@@ -2104,13 +2160,21 @@ class ZoteroSemanticSearch:
         except Exception as e:
             logger.debug(f"attachment listing failed, asking per item: {e}")
             return None
-        by_parent: dict[str, list[str]] = {}
-        for row in rows:
-            key = self._pdf_attachment_key(row)
-            parent = (row.get("data") or {}).get("parentItem") if isinstance(row, dict) else None
-            if key and parent:
-                by_parent.setdefault(parent, []).append(key)
-        return by_parent
+        priority_index = {name: i for i, name in enumerate(self.attachment_priority)}
+        fallback = priority_index.get("other")
+        grouped: dict[str, list[tuple[int, int, str]]] = {}
+        for position, row in enumerate(rows):
+            data = row.get("data", {}) if isinstance(row, dict) else {}
+            parent = data.get("parentItem")
+            found = self._fulltext_attachment(row)
+            if not parent or not found:
+                continue
+            category, key = found
+            index = priority_index.get(category, fallback)
+            if index is None:
+                continue
+            grouped.setdefault(parent, []).append((index, position, key))
+        return {parent: [key for _, _, key in sorted(items)] for parent, items in grouped.items()}
 
     def _attach_web_fulltext(
         self, items: list[dict[str, Any]], *, whole_library: bool = False
@@ -2118,7 +2182,7 @@ class ZoteroSemanticSearch:
         """Populate `data.fulltext` on each item in place using Zotero's API.
 
         Works against the web API and the local API alike: both serve the text
-        Zotero has already extracted for each PDF attachment.
+        Zotero has already extracted for each text-bearing attachment.
 
         ``whole_library`` says ``items`` is the entire library, which is when
         listing every attachment once beats asking per item. For a handful of
@@ -2134,8 +2198,8 @@ class ZoteroSemanticSearch:
         except Exception:
             pass
         fetched = 0
-        pdf_keys = (
-            self._pdf_attachment_keys_by_parent()
+        attachment_keys = (
+            self._attachment_keys_by_parent()
             if whole_library and total >= self._BULK_ATTACHMENT_WALK_MIN_ITEMS
             else None
         )
@@ -2149,11 +2213,13 @@ class ZoteroSemanticSearch:
             if not key:
                 continue
             # These are top-level items, never attachments themselves, so
-            # Zotero holds no text under their own key: ask for their PDF
-            # attachments only (the parent probe was a request per item that
-            # always came back empty).
-            if pdf_keys is not None:
-                text, source = self._fulltext_from_attachments(pdf_keys.get(key, []))
+            # Zotero holds no text under their own key: ask for their
+            # text-bearing attachments (the parent probe was a request per
+            # item that always came back empty).
+            if attachment_keys is not None:
+                text, source = self._fulltext_from_attachments(
+                    attachment_keys.get(key, [])
+                )
             else:
                 text, source = self._fetch_fulltext_via_web_api(key)
             if text:
@@ -2192,10 +2258,10 @@ class ZoteroSemanticSearch:
 
         Args:
             limit: Optional limit on number of items
-            include_fulltext: If True, fetch server-side extracted PDF text
-                via pyzotero's fulltext_item endpoint for each returned
-                top-level item. Enables full-text semantic indexing without
-                requiring local Zotero mode.
+            include_fulltext: If True, fetch server-side extracted text for
+                each returned top-level item's text-bearing attachments via
+                pyzotero's fulltext_item endpoint. Enables full-text semantic
+                indexing without requiring local Zotero mode.
 
         Returns:
             List of items from API

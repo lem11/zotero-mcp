@@ -168,6 +168,18 @@ def _pdf(key, parent=None):
     return {"key": key, "version": 1, "data": data}
 
 
+def _html(key, parent=None):
+    data = {
+        "key": key,
+        "itemType": "attachment",
+        "contentType": "text/html",
+        "filename": f"{key}.html",
+    }
+    if parent:
+        data["parentItem"] = parent
+    return {"key": key, "version": 1, "data": data}
+
+
 def _build_search(monkeypatch, zot: FakeZoteroClient, chroma: FakeChromaClient,
                   config_path: str | None = None) -> "semantic_search.ZoteroSemanticSearch":
     monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: zot)
@@ -222,23 +234,89 @@ def test_fetch_fulltext_via_web_api_returns_empty_when_nothing_available(monkeyp
     assert source == ""
 
 
-def test_fetch_fulltext_skips_non_pdf_children(monkeypatch):
+def test_fetch_fulltext_prefers_pdf_over_html_by_default(monkeypatch):
+    """HTML is eligible, but the default priority still ranks PDF first."""
     parent = _paper("PAR")
-    child_pdf = {"key": "PDF", "version": 1,
-                 "data": {"key": "PDF", "itemType": "attachment", "contentType": "application/pdf"}}
-    child_html = {"key": "HTM", "version": 1,
-                  "data": {"key": "HTM", "itemType": "attachment", "contentType": "text/html"}}
     zot = FakeZoteroClient()
     zot.load_scenario(
         [parent],
         fulltext={"PDF": {"content": "PDF text."}, "HTM": {"content": "HTML text."}},
-        children={"PAR": [child_html, child_pdf]},  # HTML listed first
+        children={"PAR": [_html("HTM"), _pdf("PDF")]},  # HTML listed first
     )
     search = _build_search(monkeypatch, zot, FakeChromaClient())
     text, source = search._fetch_fulltext_via_web_api("PAR")
-    # Should skip the HTML attachment and return the PDF's content
     assert text == "PDF text."
     assert source == "web-api:attachment:PDF"
+
+
+def test_fetch_fulltext_uses_html_when_it_is_the_only_attachment(monkeypatch):
+    """An item whose only readable attachment is an HTML snapshot must index.
+
+    This is the presentation-transcript case: no PDF child exists, so the old
+    PDF-only filter left the item with no fulltext at all.
+    """
+    parent = _paper("PAR", item_type="presentation")
+    zot = FakeZoteroClient()
+    zot.load_scenario(
+        [parent],
+        fulltext={"HTM": {"content": "Transcript body."}},
+        children={"PAR": [_html("HTM")]},
+    )
+    search = _build_search(monkeypatch, zot, FakeChromaClient())
+    text, source = search._fetch_fulltext_via_web_api("PAR")
+    assert text == "Transcript body."
+    assert source == "web-api:attachment:HTM"
+
+
+def test_fetch_fulltext_honours_configured_html_priority(monkeypatch, tmp_path):
+    """extraction.attachment_priority applies to the API path too."""
+    parent = _paper("PAR", item_type="presentation")
+    zot = FakeZoteroClient()
+    zot.load_scenario(
+        [parent],
+        fulltext={"PDF": {"content": "Slide text."}, "HTM": {"content": "Transcript body."}},
+        children={"PAR": [_pdf("PDF"), _html("HTM")]},
+    )
+    config = _write_config(tmp_path, {"extraction": {"attachment_priority": ["html", "pdf", "other"]}})
+    search = _build_search(monkeypatch, zot, FakeChromaClient(), config_path=config)
+    text, source = search._fetch_fulltext_via_web_api("PAR")
+    assert text == "Transcript body."
+    assert source == "web-api:attachment:HTM"
+
+
+def test_fetch_fulltext_falls_back_when_preferred_attachment_has_no_text(monkeypatch):
+    """A PDF with no extracted text must not mask the HTML snapshot."""
+    parent = _paper("PAR", item_type="presentation")
+    zot = FakeZoteroClient()
+    zot.load_scenario(
+        [parent],
+        fulltext={"HTM": {"content": "Transcript body."}},  # no PDF text
+        children={"PAR": [_pdf("PDF"), _html("HTM")]},
+    )
+    search = _build_search(monkeypatch, zot, FakeChromaClient())
+    text, source = search._fetch_fulltext_via_web_api("PAR")
+    assert text == "Transcript body."
+    assert source == "web-api:attachment:HTM"
+
+
+def test_fetch_fulltext_ignores_non_text_attachments(monkeypatch):
+    parent = _paper("PAR")
+    image = {
+        "key": "IMG",
+        "version": 1,
+        "data": {
+            "key": "IMG",
+            "itemType": "attachment",
+            "contentType": "image/png",
+            "filename": "scan.png",
+        },
+    }
+    zot = FakeZoteroClient()
+    zot.load_scenario([parent], children={"PAR": [image]})
+    search = _build_search(monkeypatch, zot, FakeChromaClient())
+    text, source = search._fetch_fulltext_via_web_api("PAR")
+    assert (text, source) == ("", "")
+    assert [c for c in zot.calls if c[0] == "fulltext_item"] == []
 
 
 def test_fetch_fulltext_walks_children_past_first_api_page(monkeypatch):
@@ -288,6 +366,24 @@ def test_get_items_from_api_with_fulltext_populates_data(monkeypatch):
     assert by_key["A"]["data"]["fulltext"] == "Abody"
     assert by_key["A"]["data"]["fulltextSource"] == "web-api:attachment:PA"
     assert by_key["B"]["data"]["fulltext"] == "Bbody"
+
+
+def test_bulk_attachment_walk_indexes_html_only_items(monkeypatch):
+    """The whole-library fast path must classify HTML, not only PDFs (#265)."""
+    parents, children, fulltext = [], {}, {}
+    for i in range(26):
+        parent_key, html_key = f"P{i:02d}", f"H{i:02d}"
+        parents.append(_paper(parent_key, item_type="presentation"))
+        children[parent_key] = [_html(html_key, parent=parent_key)]
+        fulltext[html_key] = {"content": f"Transcript {i}."}
+    zot = FakeZoteroClient()
+    zot.load_scenario(parents, fulltext=fulltext, children=children)
+    search = _build_search(monkeypatch, zot, FakeChromaClient())
+    items = search._get_items_from_api(include_fulltext=True)
+    assert len(items) == 26
+    for item in items:
+        assert item["data"]["fulltext"].startswith("Transcript ")
+        assert item["data"]["fulltextSource"].startswith("web-api:attachment:H")
 
 
 def test_get_items_from_api_with_fulltext_marks_misses_as_attempted(monkeypatch):
